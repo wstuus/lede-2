@@ -9,7 +9,7 @@
 	model = "Xiaomi Mi Router 4A Gigabit Edition v2";
 
 	aliases {
-		label-mac-device = &wan;
+		label-mac-device = &gmac0;
 	};
 
 	leds {
