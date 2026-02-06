@@ -13,6 +13,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
+#include <linux/string.h>
 #include <linux/if.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -550,6 +551,58 @@ static void hnat_release_netdev(void)
 	if (hnat_priv->g_wandev)
 		dev_put(hnat_priv->g_wandev);
 }
+
+static void ext_if_del_by_name(const char *dev_name)
+{
+    int i;
+    struct extdev_entry *ext_entry = NULL;
+    if (!dev_name || !hnat_priv || !hnat_priv->ext_if) return;
+	
+    for (i = 0; i < MAX_EXT_DEVS && hnat_priv->ext_if[i]; i++) {
+        if (!strcmp(hnat_priv->ext_if[i]->name, dev_name)) {
+            ext_entry = hnat_priv->ext_if[i];
+            hnat_priv->ext_if[i] = NULL; 
+            break;
+        }
+	}
+    if (ext_entry) {
+        ext_if_del(ext_entry);
+        kfree(ext_entry);
+    }
+}
+
+// hnat_netdevice_notifier → nf_hnat_netdevice_event
+ static int nf_hnat_netdevice_event(struct notifier_block *nb, unsigned long event, void *ptr)
+ {
+      struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+      struct extdev_entry *ext_entry;
+      int i; 
+      if (event == NETDEV_DOWN || event == NETDEV_UNREGISTER) {
+          ext_if_del_by_name(dev->name); 
+          dev_info(hnat_priv->dev, "hnat remove ext device: %s\n", dev->name);
+          return NOTIFY_OK;
+	  }
+      if (event != NETDEV_UP)
+          return NOTIFY_DONE;
+      if (strcmp(dev->name, "wlan0") != 0 && strcmp(dev->name, "wlan1") != 0)
+          return NOTIFY_DONE;
+      for (i = 0; i < MAX_EXT_DEVS; i++) { 
+          if (hnat_priv->ext_if[i] && !strcmp(hnat_priv->ext_if[i]->name, dev->name)) {
+              dev_info(hnat_priv->dev, "hnat device already added: %s\n", dev->name);
+              return NOTIFY_DONE;
+          }
+	  }
+      ext_entry = kzalloc(sizeof(*ext_entry), GFP_KERNEL);
+      if (!ext_entry) {
+          dev_err(hnat_priv->dev, "hnat alloc fail for %s\n", dev->name);
+          return NOTIFY_ERR;
+      }
+      strncpy(ext_entry->name, dev->name, IFNAMSIZ - 1);
+      ext_if_add(ext_entry);
+      dev_info(hnat_priv->dev, "hot add ext device: %s\n", dev->name);
+      return NOTIFY_OK;
+}
+
 
 static struct notifier_block nf_hnat_netdevice_nb __read_mostly = {
 	.notifier_call = nf_hnat_netdevice_event,
