@@ -28,6 +28,8 @@ int dbg_cpu_reason;
 int hook_toggle;
 int mape_toggle;
 int qos_toggle;
+int qos_dl_toggle = 1;
+int qos_ul_toggle = 1;
 unsigned int dbg_cpu_reason_cnt[MAX_CRSN_NUM];
 
 static const char * const entry_state[] = { "INVALID", "UNBIND", "BIND", "FIN" };
@@ -35,12 +37,13 @@ static const char * const entry_state[] = { "INVALID", "UNBIND", "BIND", "FIN" }
 static const char * const packet_type[] = {
 	"IPV4_HNAPT",    "IPV4_HNAT",     "IPV6_1T_ROUTE", "IPV4_DSLITE",
 	"IPV6_3T_ROUTE", "IPV6_5T_ROUTE", "REV",	   "IPV6_6RD",
-	"IPV4_MAP_T",    "IPV4_MAP_E",
+	"IPV4_MAP_T",    "IPV4_MAP_E",    "IPV6_HNAPT",    "IPV6_HNAT",
 };
 
 static uint8_t *show_cpu_reason(struct sk_buff *skb)
 {
 	static u8 buf[32];
+	int ret;
 
 	switch (skb_hnat_reason(skb)) {
 	case TTL_0:
@@ -89,10 +92,828 @@ static uint8_t *show_cpu_reason(struct sk_buff *skb)
 		return "Pre bind\n";
 	}
 
-	sprintf(buf, "CPU Reason Error - %X\n", skb_hnat_entry(skb));
-	return buf;
+	ret = snprintf(buf, sizeof(buf), "CPU Reason Error - %X\n",
+		       skb_hnat_entry(skb));
+	if (ret == strlen(buf))
+		return buf;
+	else
+		return "CPU Reason Error\n";
 }
 
+uint32_t foe_dump_pkt(struct sk_buff *skb)
+{
+	struct foe_entry *entry;
+
+	if (skb_hnat_entry(skb) >= hnat_priv->foe_etry_num ||
+	    skb_hnat_ppe(skb) >= CFG_PPE_NUM)
+		return 1;
+
+	entry = &hnat_priv->foe_table_cpu[skb_hnat_ppe(skb)][skb_hnat_entry(skb)];
+	pr_info("\nRx===<FOE_Entry=%d>=====\n", skb_hnat_entry(skb));
+	pr_info("RcvIF=%s\n", skb->dev->name);
+	pr_info("PPE_ID=%d\n", skb_hnat_ppe(skb));
+	pr_info("FOE_Entry=%d\n", skb_hnat_entry(skb));
+	pr_info("CPU Reason=%s", show_cpu_reason(skb));
+	pr_info("ALG=%d\n", skb_hnat_alg(skb));
+	pr_info("SP=%d\n", skb_hnat_sport(skb));
+
+	/* some special alert occurred, so entry_num is useless (just skip it) */
+	if (skb_hnat_entry(skb) == 0x3fff)
+		return 1;
+
+	/* PPE: IPv4 packet=IPV4_HNAT IPv6 packet=IPV6_ROUTE */
+	if (IS_IPV4_GRP(entry)) {
+		__be32 saddr = htonl(entry->ipv4_hnapt.sip);
+		__be32 daddr = htonl(entry->ipv4_hnapt.dip);
+
+		pr_info("Information Block 1=%x\n",
+			entry->ipv4_hnapt.info_blk1);
+		pr_info("SIP=%pI4\n", &saddr);
+		pr_info("DIP=%pI4\n", &daddr);
+		pr_info("SPORT=%d\n", entry->ipv4_hnapt.sport);
+		pr_info("DPORT=%d\n", entry->ipv4_hnapt.dport);
+		pr_info("Information Block 2=%x\n",
+			entry->ipv4_hnapt.info_blk2);
+		pr_info("State = %s, proto = %s\n", entry->bfib1.state == 0 ?
+			"Invalid" : entry->bfib1.state == 1 ?
+			"Unbind" : entry->bfib1.state == 2 ?
+			"BIND" : entry->bfib1.state == 3 ?
+			"FIN" : "Unknown",
+			entry->ipv4_hnapt.bfib1.udp == 0 ?
+			"TCP" : entry->ipv4_hnapt.bfib1.udp == 1 ?
+			"UDP" : "Unknown");
+	} else if (IS_IPV6_GRP(entry)) {
+		pr_info("Information Block 1=%x\n",
+			entry->ipv6_5t_route.info_blk1);
+		pr_info("IPv6_SIP=%08X:%08X:%08X:%08X\n",
+			entry->ipv6_5t_route.ipv6_sip0,
+			entry->ipv6_5t_route.ipv6_sip1,
+			entry->ipv6_5t_route.ipv6_sip2,
+			entry->ipv6_5t_route.ipv6_sip3);
+		pr_info("IPv6_DIP=%08X:%08X:%08X:%08X\n",
+			entry->ipv6_5t_route.ipv6_dip0,
+			entry->ipv6_5t_route.ipv6_dip1,
+			entry->ipv6_5t_route.ipv6_dip2,
+			entry->ipv6_5t_route.ipv6_dip3);
+		pr_info("SPORT=%d\n", entry->ipv6_5t_route.sport);
+		pr_info("DPORT=%d\n", entry->ipv6_5t_route.dport);
+		pr_info("Information Block 2=%x\n",
+			entry->ipv6_5t_route.info_blk2);
+		pr_info("State = %s, proto = %s\n", entry->bfib1.state == 0 ?
+			"Invalid" : entry->bfib1.state == 1 ?
+			"Unbind" : entry->bfib1.state == 2 ?
+			"BIND" : entry->bfib1.state == 3 ?
+			"FIN" : "Unknown",
+			entry->ipv6_5t_route.bfib1.udp == 0 ?
+			"TCP" : entry->ipv6_5t_route.bfib1.udp == 1 ?
+			"UDP" :	"Unknown");
+	} else {
+		pr_info("unknown Pkt_type=%d\n", entry->bfib1.pkt_type);
+	}
+
+	pr_info("==================================\n");
+	return 1;
+}
+
+uint32_t hnat_cpu_reason_cnt(struct sk_buff *skb)
+{
+	switch (skb_hnat_reason(skb)) {
+	case TTL_0:
+		dbg_cpu_reason_cnt[0]++;
+		return 0;
+	case HAS_OPTION_HEADER:
+		dbg_cpu_reason_cnt[1]++;
+		return 0;
+	case NO_FLOW_IS_ASSIGNED:
+		dbg_cpu_reason_cnt[2]++;
+		return 0;
+	case IPV4_WITH_FRAGMENT:
+		dbg_cpu_reason_cnt[3]++;
+		return 0;
+	case IPV4_HNAPT_DSLITE_WITH_FRAGMENT:
+		dbg_cpu_reason_cnt[4]++;
+		return 0;
+	case IPV4_HNAPT_DSLITE_WITHOUT_TCP_UDP:
+		dbg_cpu_reason_cnt[5]++;
+		return 0;
+	case IPV6_5T_6RD_WITHOUT_TCP_UDP:
+		dbg_cpu_reason_cnt[6]++;
+		return 0;
+	case TCP_FIN_SYN_RST:
+		dbg_cpu_reason_cnt[7]++;
+		return 0;
+	case UN_HIT:
+		dbg_cpu_reason_cnt[8]++;
+		return 0;
+	case HIT_UNBIND:
+		dbg_cpu_reason_cnt[9]++;
+		return 0;
+	case HIT_UNBIND_RATE_REACH:
+		dbg_cpu_reason_cnt[10]++;
+		return 0;
+	case HIT_BIND_TCP_FIN:
+		dbg_cpu_reason_cnt[11]++;
+		return 0;
+	case HIT_BIND_TTL_1:
+		dbg_cpu_reason_cnt[12]++;
+		return 0;
+	case HIT_BIND_WITH_VLAN_VIOLATION:
+		dbg_cpu_reason_cnt[13]++;
+		return 0;
+	case HIT_BIND_KEEPALIVE_UC_OLD_HDR:
+		dbg_cpu_reason_cnt[14]++;
+		return 0;
+	case HIT_BIND_KEEPALIVE_MC_NEW_HDR:
+		dbg_cpu_reason_cnt[15]++;
+		return 0;
+	case HIT_BIND_KEEPALIVE_DUP_OLD_HDR:
+		dbg_cpu_reason_cnt[16]++;
+		return 0;
+	case HIT_BIND_FORCE_TO_CPU:
+		dbg_cpu_reason_cnt[17]++;
+		return 0;
+	case HIT_BIND_EXCEED_MTU:
+		dbg_cpu_reason_cnt[18]++;
+		return 0;
+	case HIT_BIND_MULTICAST_TO_CPU:
+		dbg_cpu_reason_cnt[19]++;
+		return 0;
+	case HIT_BIND_MULTICAST_TO_GMAC_CPU:
+		dbg_cpu_reason_cnt[20]++;
+		return 0;
+	case HIT_PRE_BIND:
+		dbg_cpu_reason_cnt[21]++;
+		return 0;
+	}
+
+	return 0;
+}
+
+int hnat_set_usage(int level)
+{
+	debug_level = level;
+	pr_info("Read cpu_reason count: cat /sys/kernel/debug/hnat/cpu_reason\n\n");
+	pr_info("====================Advanced Settings====================\n");
+	pr_info("Usage: echo [type] [option] > /sys/kernel/debug/hnat/cpu_reason\n\n");
+	pr_info("Commands:   [type] [option]\n");
+	pr_info("              0       0~7      Set debug_level(0~7), current debug_level=%d\n",
+		debug_level);
+	pr_info("              1    cpu_reason  Track entries of the set cpu_reason\n");
+	pr_info("                               Set type=1 will change debug_level=7\n");
+	pr_info("cpu_reason list:\n");
+	pr_info("                       2       IPv4(IPv6) TTL(hop limit) = 0\n");
+	pr_info("                       3       IPv4(IPv6) has option(extension) header\n");
+	pr_info("                       7       No flow is assigned\n");
+	pr_info("                       8       IPv4 HNAT doesn't support IPv4 /w fragment\n");
+	pr_info("                       9       IPv4 HNAPT/DS-Lite doesn't support IPv4 /w fragment\n");
+	pr_info("                      10       IPv4 HNAPT/DS-Lite can't find TCP/UDP sport/dport\n");
+	pr_info("                      11       IPv6 5T-route/6RD can't find TCP/UDP sport/dport\n");
+	pr_info("                      12       Ingress packet is TCP fin/syn/rst\n");
+	pr_info("                      13       FOE Un-hit\n");
+	pr_info("                      14       FOE Hit unbind\n");
+	pr_info("                      15       FOE Hit unbind & rate reach\n");
+	pr_info("                      16       Hit bind PPE TCP FIN entry\n");
+	pr_info("                      17       Hit bind PPE entry and TTL(hop limit) = 1\n");
+	pr_info("                      18       Hit bind and VLAN replacement violation\n");
+	pr_info("                      19       Hit bind and keep alive with unicast old-header packet\n");
+	pr_info("                      20       Hit bind and keep alive with multicast new-header packet\n");
+	pr_info("                      21       Hit bind and keep alive with duplicate old-header packet\n");
+	pr_info("                      22       FOE Hit bind & force to CPU\n");
+	pr_info("                      23       HIT_BIND_WITH_OPTION_HEADER\n");
+	pr_info("                      24       Switch clone multicast packet to CPU\n");
+	pr_info("                      25       Switch clone multicast packet to GMAC1 & CPU\n");
+	pr_info("                      26       HIT_PRE_BIND\n");
+	pr_info("                      27       HIT_BIND_PACKET_SAMPLING\n");
+	pr_info("                      28       Hit bind and exceed MTU\n");
+
+	return 0;
+}
+
+int hnat_cpu_reason(int cpu_reason)
+{
+	dbg_cpu_reason = cpu_reason;
+	debug_level = 7;
+	pr_info("show cpu reason = %d\n", cpu_reason);
+
+	return 0;
+}
+
+int entry_set_usage(int level)
+{
+	debug_level = level;
+	pr_info("Show all entries(default state=bind): cat /sys/kernel/debug/hnat/hnat_entry\n\n");
+	pr_info("====================Advanced Settings====================\n");
+	pr_info("Usage: echo [type] [option] > /sys/kernel/debug/hnat/hnat_entry\n\n");
+	pr_info("Commands:   [type] [option]\n");
+	pr_info("              0       0~7      Set debug_level(0~7), current debug_level=%d\n",
+		debug_level);
+	pr_info("              1       0~3      Change tracking state\n");
+	pr_info("                               (0:invalid; 1:unbind; 2:bind; 3:fin)\n");
+	pr_info("              2   <entry_idx>  Show PPE0 specific foe entry info. of assigned <entry_idx>\n");
+	pr_info("              3   <entry_idx>  Delete PPE0 specific foe entry of assigned <entry_idx>\n");
+	pr_info("              4   <entry_idx>  Show PPE1 specific foe entry info. of assigned <entry_idx>\n");
+	pr_info("              5   <entry_idx>  Delete PPE1 specific foe entry of assigned <entry_idx>\n");
+	pr_info("                               When entry_idx is -1, clear all entries\n");
+
+	return 0;
+}
+
+int entry_set_state(int state)
+{
+	dbg_entry_state = state;
+	pr_info("ENTRY STATE = %s\n", dbg_entry_state == 0 ?
+		"Invalid" : dbg_entry_state == 1 ?
+		"Unbind" : dbg_entry_state == 2 ?
+		"BIND" : dbg_entry_state == 3 ?
+		"FIN" : "Unknown");
+	return 0;
+}
+
+int wrapped_ppe0_entry_detail(int index) {
+	entry_detail(0, index);
+	return 0;
+}
+
+int wrapped_ppe1_entry_detail(int index) {
+	entry_detail(1, index);
+	return 0;
+}
+
+int entry_detail(u32 ppe_id, int index)
+{
+	struct foe_entry *entry;
+	struct mtk_hnat *h = hnat_priv;
+	u32 *p;
+	u32 i = 0;
+	u32 print_cnt;
+	unsigned char h_dest[ETH_ALEN];
+	unsigned char h_source[ETH_ALEN];
+	__be32 saddr, daddr, nsaddr, ndaddr;
+
+	if (ppe_id >= CFG_PPE_NUM)
+		return -EINVAL;
+
+	if (index < 0 || index >= h->foe_etry_num) {
+		pr_info("Invalid entry index\n");
+		return -EINVAL;
+	}
+
+	entry = h->foe_table_cpu[ppe_id] + index;
+	saddr = htonl(entry->ipv4_hnapt.sip);
+	daddr = htonl(entry->ipv4_hnapt.dip);
+	nsaddr = htonl(entry->ipv4_hnapt.new_sip);
+	ndaddr = htonl(entry->ipv4_hnapt.new_dip);
+	p = (uint32_t *)entry;
+	pr_info("==========<PPE_ID=%d, Flow Table Entry=%d (%p)>===============\n",
+		ppe_id, index, entry);
+	if (debug_level >= 2) {
+		print_cnt = 20;
+		for (i = 0; i < print_cnt; i++)
+			pr_info("%02d: %08X\n", i, *(p + i));
+	}
+	pr_info("-----------------<Flow Info>------------------\n");
+	pr_info("Information Block 1: %08X\n", entry->ipv4_hnapt.info_blk1);
+
+	if (IS_IPV4_HNAPT(entry)) {
+		pr_info("Information Block 2: %08X (FP=%d FQOS=%d QID=%d)",
+			entry->ipv4_hnapt.info_blk2,
+			entry->ipv4_hnapt.iblk2.dp,
+			entry->ipv4_hnapt.iblk2.fqos,
+			entry->ipv4_hnapt.iblk2.qid);
+		pr_info("Create IPv4 HNAPT entry\n");
+		pr_info("IPv4 Org IP/Port: %pI4:%d->%pI4:%d\n", &saddr,
+			entry->ipv4_hnapt.sport, &daddr,
+			entry->ipv4_hnapt.dport);
+		pr_info("IPv4 New IP/Port: %pI4:%d->%pI4:%d\n", &nsaddr,
+			entry->ipv4_hnapt.new_sport, &ndaddr,
+			entry->ipv4_hnapt.new_dport);
+	} else if (IS_IPV4_HNAT(entry)) {
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv4_hnapt.info_blk2);
+		pr_info("Create IPv4 HNAT entry\n");
+		pr_info("IPv4 Org IP: %pI4->%pI4\n", &saddr, &daddr);
+		pr_info("IPv4 New IP: %pI4->%pI4\n", &nsaddr, &ndaddr);
+	} else if (IS_IPV4_DSLITE(entry)) {
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv4_dslite.info_blk2);
+		pr_info("Create IPv4 Ds-Lite entry\n");
+		pr_info("IPv4 Ds-Lite: %pI4:%d->%pI4:%d\n", &saddr,
+			entry->ipv4_dslite.sport, &daddr,
+			entry->ipv4_dslite.dport);
+		pr_info("EG DIPv6: %08X:%08X:%08X:%08X->%08X:%08X:%08X:%08X\n",
+			entry->ipv4_dslite.tunnel_sipv6_0,
+			entry->ipv4_dslite.tunnel_sipv6_1,
+			entry->ipv4_dslite.tunnel_sipv6_2,
+			entry->ipv4_dslite.tunnel_sipv6_3,
+			entry->ipv4_dslite.tunnel_dipv6_0,
+			entry->ipv4_dslite.tunnel_dipv6_1,
+			entry->ipv4_dslite.tunnel_dipv6_2,
+			entry->ipv4_dslite.tunnel_dipv6_3);
+#if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)
+	} else if (IS_IPV4_MAPE(entry)) {
+		nsaddr = htonl(entry->ipv4_mape.new_sip);
+		ndaddr = htonl(entry->ipv4_mape.new_dip);
+
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv4_dslite.info_blk2);
+		pr_info("Create IPv4 MAP-E entry\n");
+		pr_info("IPv4 MAP-E Org IP/Port: %pI4:%d->%pI4:%d\n",
+			&saddr,	entry->ipv4_dslite.sport,
+			&daddr,	entry->ipv4_dslite.dport);
+		pr_info("IPv4 MAP-E New IP/Port: %pI4:%d->%pI4:%d\n",
+			&nsaddr, entry->ipv4_mape.new_sport,
+			&ndaddr, entry->ipv4_mape.new_dport);
+		pr_info("EG DIPv6: %08X:%08X:%08X:%08X->%08X:%08X:%08X:%08X\n",
+			entry->ipv4_dslite.tunnel_sipv6_0,
+			entry->ipv4_dslite.tunnel_sipv6_1,
+			entry->ipv4_dslite.tunnel_sipv6_2,
+			entry->ipv4_dslite.tunnel_sipv6_3,
+			entry->ipv4_dslite.tunnel_dipv6_0,
+			entry->ipv4_dslite.tunnel_dipv6_1,
+			entry->ipv4_dslite.tunnel_dipv6_2,
+			entry->ipv4_dslite.tunnel_dipv6_3);
+#endif
+	} else if (IS_IPV6_3T_ROUTE(entry)) {
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv6_3t_route.info_blk2);
+		pr_info("Create IPv6 3-Tuple entry\n");
+		pr_info("ING SIPv6->DIPv6: %08X:%08X:%08X:%08X-> %08X:%08X:%08X:%08X (Prot=%d)\n",
+			entry->ipv6_3t_route.ipv6_sip0,
+			entry->ipv6_3t_route.ipv6_sip1,
+			entry->ipv6_3t_route.ipv6_sip2,
+			entry->ipv6_3t_route.ipv6_sip3,
+			entry->ipv6_3t_route.ipv6_dip0,
+			entry->ipv6_3t_route.ipv6_dip1,
+			entry->ipv6_3t_route.ipv6_dip2,
+			entry->ipv6_3t_route.ipv6_dip3,
+			entry->ipv6_3t_route.prot);
+	} else if (IS_IPV6_5T_ROUTE(entry)) {
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv6_5t_route.info_blk2);
+		pr_info("Create IPv6 5-Tuple entry\n");
+		pr_info("ING SIPv6->DIPv6: %08X:%08X:%08X:%08X:%d-> %08X:%08X:%08X:%08X:%d\n",
+			entry->ipv6_5t_route.ipv6_sip0,
+			entry->ipv6_5t_route.ipv6_sip1,
+			entry->ipv6_5t_route.ipv6_sip2,
+			entry->ipv6_5t_route.ipv6_sip3,
+			entry->ipv6_5t_route.sport,
+			entry->ipv6_5t_route.ipv6_dip0,
+			entry->ipv6_5t_route.ipv6_dip1,
+			entry->ipv6_5t_route.ipv6_dip2,
+			entry->ipv6_5t_route.ipv6_dip3,
+			entry->ipv6_5t_route.dport);
+	} else if (IS_IPV6_6RD(entry)) {
+		pr_info("Information Block 2: %08X\n",
+			entry->ipv6_6rd.info_blk2);
+		pr_info("Create IPv6 6RD entry\n");
+		pr_info("ING SIPv6->DIPv6: %08X:%08X:%08X:%08X:%d-> %08X:%08X:%08X:%08X:%d\n",
+			entry->ipv6_6rd.ipv6_sip0, entry->ipv6_6rd.ipv6_sip1,
+			entry->ipv6_6rd.ipv6_sip2, entry->ipv6_6rd.ipv6_sip3,
+			entry->ipv6_6rd.sport, entry->ipv6_6rd.ipv6_dip0,
+			entry->ipv6_6rd.ipv6_dip1, entry->ipv6_6rd.ipv6_dip2,
+			entry->ipv6_6rd.ipv6_dip3, entry->ipv6_6rd.dport);
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	} else if (IS_IPV6_HNAPT(entry)) {
+		pr_info("Information Block 2: %08X (FP=%d FQOS=%d QID=%d)",
+			entry->ipv6_hnapt.info_blk2,
+			entry->ipv6_hnapt.iblk2.dp,
+			entry->ipv6_hnapt.iblk2.fqos,
+			entry->ipv6_hnapt.iblk2.qid);
+		pr_info("Create IPv6 HNAPT entry\n");
+		pr_info("IPv6 Org IP/Port: %08X:%08X:%08X:%08X:%d -> %08X:%08X:%08X:%08X:%d",
+			entry->ipv6_hnapt.ipv6_sip0,
+			entry->ipv6_hnapt.ipv6_sip1,
+			entry->ipv6_hnapt.ipv6_sip2,
+			entry->ipv6_hnapt.ipv6_sip3,
+			entry->ipv6_hnapt.sport,
+			entry->ipv6_hnapt.ipv6_dip0,
+			entry->ipv6_hnapt.ipv6_dip1,
+			entry->ipv6_hnapt.ipv6_dip2,
+			entry->ipv6_hnapt.ipv6_dip3,
+			entry->ipv6_hnapt.dport);
+
+		if (entry->ipv6_hnapt.eg_ipv6_dir == IPV6_SNAT) {
+			pr_info("IPv6 New IP/Port: %08X:%08X:%08X:%08X:%d -> %08X:%08X:%08X:%08X:%d\n",
+				entry->ipv6_hnapt.new_ipv6_ip0,
+				entry->ipv6_hnapt.new_ipv6_ip1,
+				entry->ipv6_hnapt.new_ipv6_ip2,
+				entry->ipv6_hnapt.new_ipv6_ip3,
+				entry->ipv6_hnapt.new_sport,
+				entry->ipv6_hnapt.ipv6_dip0,
+				entry->ipv6_hnapt.ipv6_dip1,
+				entry->ipv6_hnapt.ipv6_dip2,
+				entry->ipv6_hnapt.ipv6_dip3,
+				entry->ipv6_hnapt.new_dport);
+		} else if (entry->ipv6_hnapt.eg_ipv6_dir == IPV6_DNAT) {
+			pr_info("IPv6 New IP/Port: %08X:%08X:%08X:%08X:%d -> %08X:%08X:%08X:%08X:%d\n",
+				entry->ipv6_hnapt.ipv6_sip0,
+				entry->ipv6_hnapt.ipv6_sip1,
+				entry->ipv6_hnapt.ipv6_sip2,
+				entry->ipv6_hnapt.ipv6_sip3,
+				entry->ipv6_hnapt.new_sport,
+				entry->ipv6_hnapt.new_ipv6_ip0,
+				entry->ipv6_hnapt.new_ipv6_ip1,
+				entry->ipv6_hnapt.new_ipv6_ip2,
+				entry->ipv6_hnapt.new_ipv6_ip3,
+				entry->ipv6_hnapt.new_dport);
+		}
+	} else if (IS_IPV6_HNAT(entry)) {
+		pr_info("Information Block 2: %08X (FP=%d FQOS=%d QID=%d)",
+			entry->ipv6_hnapt.info_blk2,
+			entry->ipv6_hnapt.iblk2.dp,
+			entry->ipv6_hnapt.iblk2.fqos,
+			entry->ipv6_hnapt.iblk2.qid);
+		pr_info("Create IPv6 HNAT entry\n");
+		pr_info("IPv6 Org IP: %08X:%08X:%08X:%08X -> %08X:%08X:%08X:%08X",
+			entry->ipv6_hnapt.ipv6_sip0,
+			entry->ipv6_hnapt.ipv6_sip1,
+			entry->ipv6_hnapt.ipv6_sip2,
+			entry->ipv6_hnapt.ipv6_sip3,
+			entry->ipv6_hnapt.ipv6_dip0,
+			entry->ipv6_hnapt.ipv6_dip1,
+			entry->ipv6_hnapt.ipv6_dip2,
+			entry->ipv6_hnapt.ipv6_dip3);
+
+		if (entry->ipv6_hnapt.eg_ipv6_dir == IPV6_SNAT) {
+			pr_info("IPv6 New IP: %08X:%08X:%08X:%08X -> %08X:%08X:%08X:%08X\n",
+				entry->ipv6_hnapt.new_ipv6_ip0,
+				entry->ipv6_hnapt.new_ipv6_ip1,
+				entry->ipv6_hnapt.new_ipv6_ip2,
+				entry->ipv6_hnapt.new_ipv6_ip3,
+				entry->ipv6_hnapt.ipv6_dip0,
+				entry->ipv6_hnapt.ipv6_dip1,
+				entry->ipv6_hnapt.ipv6_dip2,
+				entry->ipv6_hnapt.ipv6_dip3);
+		} else if (entry->ipv6_hnapt.eg_ipv6_dir == IPV6_DNAT) {
+			pr_info("IPv6 New IP: %08X:%08X:%08X:%08X -> %08X:%08X:%08X:%08X\n",
+				entry->ipv6_hnapt.ipv6_sip0,
+				entry->ipv6_hnapt.ipv6_sip1,
+				entry->ipv6_hnapt.ipv6_sip2,
+				entry->ipv6_hnapt.ipv6_sip3,
+				entry->ipv6_hnapt.new_ipv6_ip0,
+				entry->ipv6_hnapt.new_ipv6_ip1,
+				entry->ipv6_hnapt.new_ipv6_ip2,
+				entry->ipv6_hnapt.new_ipv6_ip3);
+		}
+#endif
+	}
+
+	if (IS_IPV4_HNAPT(entry) || IS_IPV4_HNAT(entry)) {
+		*((u32 *)h_source) = swab32(entry->ipv4_hnapt.smac_hi);
+		*((u16 *)&h_source[4]) = swab16(entry->ipv4_hnapt.smac_lo);
+		*((u32 *)h_dest) = swab32(entry->ipv4_hnapt.dmac_hi);
+		*((u16 *)&h_dest[4]) = swab16(entry->ipv4_hnapt.dmac_lo);
+		pr_info("SMAC=%pM => DMAC=%pM\n", h_source, h_dest);
+		pr_info("State = %s, ",	entry->bfib1.state == 0 ?
+			"Invalid" : entry->bfib1.state == 1 ?
+			"Unbind" : entry->bfib1.state == 2 ?
+			"BIND" : entry->bfib1.state == 3 ?
+			"FIN" : "Unknown");
+		pr_info("Vlan_Layer = %u, ", entry->bfib1.vlan_layer);
+		pr_info("Eth_type = 0x%x, Vid1 = 0x%x, Vid2 = 0x%x\n",
+			entry->ipv4_hnapt.etype, entry->ipv4_hnapt.vlan1,
+			entry->ipv4_hnapt.vlan2);
+		pr_info("multicast = %d, pppoe = %d, proto = %s\n",
+			entry->ipv4_hnapt.iblk2.mcast,
+			entry->ipv4_hnapt.bfib1.psn,
+			entry->ipv4_hnapt.bfib1.udp == 0 ?
+			"TCP" :	entry->ipv4_hnapt.bfib1.udp == 1 ?
+			"UDP" : "Unknown");
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+		pr_info("tport_id = %d, tops_entry = %d, cdrt_id = %d\n",
+			entry->ipv4_hnapt.tport_id,
+			entry->ipv4_hnapt.tops_entry,
+			entry->ipv4_hnapt.cdrt_id);
+#endif
+		pr_info("=========================================\n\n");
+	} else {
+		*((u32 *)h_source) = swab32(entry->ipv6_5t_route.smac_hi);
+		*((u16 *)&h_source[4]) = swab16(entry->ipv6_5t_route.smac_lo);
+		*((u32 *)h_dest) = swab32(entry->ipv6_5t_route.dmac_hi);
+		*((u16 *)&h_dest[4]) = swab16(entry->ipv6_5t_route.dmac_lo);
+		pr_info("SMAC=%pM => DMAC=%pM\n", h_source, h_dest);
+		pr_info("State = %s, ",	entry->bfib1.state == 0 ?
+			"Invalid" : entry->bfib1.state == 1 ?
+			"Unbind" : entry->bfib1.state == 2 ?
+			"BIND" : entry->bfib1.state == 3 ?
+			"FIN" : "Unknown");
+
+		pr_info("Vlan_Layer = %u, ", entry->bfib1.vlan_layer);
+		pr_info("Eth_type = 0x%x, Vid1 = 0x%x, Vid2 = 0x%x\n",
+			entry->ipv6_5t_route.etype, entry->ipv6_5t_route.vlan1,
+			entry->ipv6_5t_route.vlan2);
+		pr_info("multicast = %d, pppoe = %d, proto = %s\n",
+			entry->ipv6_5t_route.iblk2.mcast,
+			entry->ipv6_5t_route.bfib1.psn,
+			entry->ipv6_5t_route.bfib1.udp == 0 ?
+			"TCP" :	entry->ipv6_5t_route.bfib1.udp == 1 ?
+			"UDP" :	"Unknown");
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+		pr_info("tport_id = %d, tops_entry = %d, cdrt_id = %d\n",
+			entry->ipv6_5t_route.tport_id,
+			entry->ipv6_5t_route.tops_entry,
+			entry->ipv6_5t_route.cdrt_id);
+#endif
+		pr_info("=========================================\n\n");
+	}
+	return 0;
+}
+
+int wrapped_ppe0_entry_delete(int index) {
+	entry_delete(0, index);
+	return 0;
+}
+
+int wrapped_ppe1_entry_delete(int index) {
+	entry_delete(1, index);
+	return 0;
+}
+
+int entry_delete(u32 ppe_id, int index)
+{
+	struct foe_entry *entry;
+	struct mtk_hnat *h = hnat_priv;
+
+	if (ppe_id >= CFG_PPE_NUM)
+		return -EINVAL;
+
+	if (index < -1 || index >= (int)h->foe_etry_num) {
+		pr_info("Invalid entry index\n");
+		return -EINVAL;
+	}
+
+	if (index == -1) {
+		memset(h->foe_table_cpu[ppe_id], 0, h->foe_etry_num * sizeof(struct foe_entry));
+		pr_info("clear all foe entry\n");
+	} else {
+
+		entry = h->foe_table_cpu[ppe_id] + index;
+		memset(entry, 0, sizeof(struct foe_entry));
+		pr_info("delete ppe id = %d, entry idx = %d\n", ppe_id, index);
+	}
+
+	/* clear HWNAT cache */
+	hnat_cache_ebl(1);
+
+	return 0;
+}
+EXPORT_SYMBOL(entry_delete);
+
+int cr_set_usage(int level)
+{
+	debug_level = level;
+	pr_info("Dump hnat CR: cat /sys/kernel/debug/hnat/hnat_setting\n\n");
+	pr_info("====================Advanced Settings====================\n");
+	pr_info("Usage: echo [type] [option] > /sys/kernel/debug/hnat/hnat_setting\n\n");
+	pr_info("Commands:   [type] [option]\n");
+	pr_info("              0     0~7        Set debug_level(0~7), current debug_level=%d\n",
+		debug_level);
+	pr_info("              1     0~65535    Set binding threshold\n");
+	pr_info("              2     0~65535    Set TCP bind lifetime\n");
+	pr_info("              3     0~65535    Set FIN bind lifetime\n");
+	pr_info("              4     0~65535    Set UDP bind lifetime\n");
+	pr_info("              5     0~255      Set TCP keep alive interval\n");
+	pr_info("              6     0~255      Set UDP keep alive interval\n");
+	pr_info("              7     0~1        Set hnat counter update to nf_conntrack\n");
+
+	return 0;
+}
+
+int binding_threshold(int threshold)
+{
+	int i;
+
+	pr_info("Binding Threshold =%d\n", threshold);
+
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		writel(threshold, hnat_priv->ppe_base[i] + PPE_BNDR);
+
+	return 0;
+}
+
+int tcp_bind_lifetime(int tcp_life)
+{
+	int i;
+
+	pr_info("tcp_life = %d\n", tcp_life);
+
+	/* set Delta time for aging out an bind TCP FOE entry */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		cr_set_field(hnat_priv->ppe_base[i] + PPE_BND_AGE_1,
+			     TCP_DLTA, tcp_life);
+
+	return 0;
+}
+
+int fin_bind_lifetime(int fin_life)
+{
+	int i;
+
+	pr_info("fin_life = %d\n", fin_life);
+
+	/* set Delta time for aging out an bind TCP FIN FOE entry */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		cr_set_field(hnat_priv->ppe_base[i] + PPE_BND_AGE_1,
+			     FIN_DLTA, fin_life);
+
+	return 0;
+}
+
+int udp_bind_lifetime(int udp_life)
+{
+	int i;
+
+	pr_info("udp_life = %d\n", udp_life);
+
+	/* set Delta time for aging out an bind UDP FOE entry */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		cr_set_field(hnat_priv->ppe_base[i] + PPE_BND_AGE_0,
+			     UDP_DLTA, udp_life);
+
+	return 0;
+}
+
+int tcp_keep_alive(int tcp_interval)
+{
+	int i;
+
+	if (tcp_interval > 255) {
+		tcp_interval = 255;
+		pr_info("TCP keep alive max interval = 255\n");
+	} else {
+		pr_info("tcp_interval = %d\n", tcp_interval);
+	}
+
+	/* Keep alive time for bind FOE TCP entry */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		cr_set_field(hnat_priv->ppe_base[i] + PPE_KA,
+			     TCP_KA, tcp_interval);
+
+	return 0;
+}
+
+int udp_keep_alive(int udp_interval)
+{
+	int i;
+
+	if (udp_interval > 255) {
+		udp_interval = 255;
+		pr_info("TCP/UDP keep alive max interval = 255\n");
+	} else {
+		pr_info("udp_interval = %d\n", udp_interval);
+	}
+
+	/* Keep alive timer for bind FOE UDP entry */
+	for (i = 0; i < CFG_PPE_NUM; i++)
+		cr_set_field(hnat_priv->ppe_base[i] + PPE_KA,
+			     UDP_KA, udp_interval);
+
+	return 0;
+}
+
+int set_nf_update_toggle(int toggle)
+{
+	struct mtk_hnat *h = hnat_priv;
+
+	if (toggle == 1)
+		pr_info("Enable hnat counter update to nf_conntrack\n");
+	else if (toggle == 0)
+		pr_info("Disable hnat counter update to nf_conntrack\n");
+	else
+		pr_info("input error\n");
+	h->nf_stat_en = toggle;
+
+	return 0;
+}
+
+static const debugfs_write_func hnat_set_func[] = {
+	[0] = hnat_set_usage,
+	[1] = hnat_cpu_reason,
+};
+
+static const debugfs_write_func entry_set_func[] = {
+	[0] = entry_set_usage,
+	[1] = entry_set_state,
+	[2] = wrapped_ppe0_entry_detail,
+	[3] = wrapped_ppe0_entry_delete,
+	[4] = wrapped_ppe1_entry_detail,
+	[5] = wrapped_ppe1_entry_delete,
+};
+
+static const debugfs_write_func cr_set_func[] = {
+	[0] = cr_set_usage,      [1] = binding_threshold,
+	[2] = tcp_bind_lifetime, [3] = fin_bind_lifetime,
+	[4] = udp_bind_lifetime, [5] = tcp_keep_alive,
+	[6] = udp_keep_alive,    [7] = set_nf_update_toggle,
+};
+
+int read_mib(struct mtk_hnat *h, u32 ppe_id,
+	     u32 index, u64 *bytes, u64 *packets)
+{
+	int ret;
+	u32 val, cnt_r0, cnt_r1, cnt_r2, cnt_r3;
+
+	if (ppe_id >= CFG_PPE_NUM)
+		return -EINVAL;
+
+	writel(index | (1 << 16), h->ppe_base[ppe_id] + PPE_MIB_SER_CR);
+	ret = readx_poll_timeout_atomic(readl, h->ppe_base[ppe_id] + PPE_MIB_SER_CR, val,
+					!(val & BIT_MIB_BUSY), 20, 10000);
+
+	if (ret < 0) {
+		pr_notice("mib busy, please check later\n");
+		return ret;
+	}
+	cnt_r0 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R0);
+	cnt_r1 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R1);
+	cnt_r2 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R2);
+
+	if (hnat_priv->data->version == MTK_HNAT_V3) {
+		cnt_r3 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R3);
+		*bytes = cnt_r0 + ((u64)cnt_r1 << 32);
+		*packets = cnt_r2 + ((u64)cnt_r3 << 32);
+	} else {
+		*bytes = cnt_r0 + ((u64)(cnt_r1 & 0xffff) << 32);
+		*packets = ((cnt_r1 & 0xffff0000) >> 16) +
+			   ((u64)(cnt_r2 & 0xffffff) << 16);
+	}
+
+	return 0;
+
+}
+
+struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
+				       u32 index, struct hnat_accounting *diff)
+
+{
+	u64 bytes, packets;
+
+	if (ppe_id >= CFG_PPE_NUM)
+		return NULL;
+
+	if (index >= hnat_priv->foe_etry_num)
+		return NULL;
+
+	if (!hnat_priv->data->per_flow_accounting)
+		return NULL;
+
+	if (read_mib(h, ppe_id, index, &bytes, &packets))
+		return NULL;
+
+	h->acct[ppe_id][index].bytes += bytes;
+	h->acct[ppe_id][index].packets += packets;
+
+	if (diff) {
+		diff->bytes = bytes;
+		diff->packets = packets;
+	}
+
+	return &h->acct[ppe_id][index];
+}
+EXPORT_SYMBOL(hnat_get_count);
+
+#define PRINT_COUNT(m, acct) {if (acct) \
+		seq_printf(m, "bytes=%llu|packets=%llu|", \
+			   acct->bytes, acct->packets); }
+static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
+{
+	struct mtk_hnat *h = hnat_priv;
+	struct foe_entry *entry, *end;
+	unsigned char h_dest[ETH_ALEN];
+	unsigned char h_source[ETH_ALEN];
+	struct hnat_accounting *acct;
+	u32 entry_index = 0;
+
+	if (ppe_id >= CFG_PPE_NUM)
+		return -EINVAL;
+
+	entry = h->foe_table_cpu[ppe_id];
+	end = h->foe_table_cpu[ppe_id] + hnat_priv->foe_etry_num;
+	while (entry < end) {
+		if (!entry->bfib1.state) {
+			entry++;
+			entry_index++;
+			continue;
+		}
+		acct = hnat_get_count(h, ppe_id, entry_index, NULL);
+		if (IS_IPV4_HNAPT(entry)) {
+			__be32 saddr = htonl(entry->ipv4_hnapt.sip);
+			__be32 daddr = htonl(entry->ipv4_hnapt.dip);
+			__be32 nsaddr = htonl(entry->ipv4_hnapt.new_sip);
+			__be32 ndaddr = htonl(entry->ipv4_hnapt.new_dip);
+
+			*((u32 *)h_source) = swab32(entry->ipv4_hnapt.smac_hi);
+			*((u16 *)&h_source[4]) =
+				swab16(entry->ipv4_hnapt.smac_lo);
+			*((u32 *)h_dest) = swab32(entry->ipv4_hnapt.dmac_hi);
+			*((u16 *)&h_dest[4]) =
+				swab16(entry->ipv4_hnapt.dmac_lo);
+			PRINT_COUNT(m, acct);
+			seq_printf(m,
+				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|%pI4:%d->%pI4:%d=>%pI4:%d->%pI4:%d|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x|vlan1=%d|vlan2=%d\n",
+				   entry, ppe_id, ei(entry, end),
+				   es(entry), pt(entry), &saddr,
+				   entry->
 uint32_t foe_dump_pkt(struct sk_buff *skb)
 {
 	struct foe_entry *entry;
